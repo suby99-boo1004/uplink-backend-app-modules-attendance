@@ -25,8 +25,6 @@ from app.modules.attendance.service import summarize_today
 router = APIRouter(tags=["Attendance"])
 KST = ZoneInfo("Asia/Seoul")
 
-INTERNAL_ROLE_IDS = (6, 7, 8)  # 관리자/운영자/회사직원
-
 
 # -----------------------------------------------------------------------------
 # Auth dependency (defensive load)
@@ -63,35 +61,82 @@ def today_status(
     db: Session = Depends(get_db),
 ):
     today_kst = datetime.now(KST).date()
-    internal_ids = _get_internal_user_id_set(db)
-    rows = summarize_today(db, today_kst, include_all=include_all)
-    # summarize_today 반환 형태(dict/obj) 모두 대응
+    items = summarize_today(db, today_kst, include_all=include_all)
+    return _filter_today_status_to_internal(db, items)
+
+
+# -----------------------------------------------------------------------------
+# Internal users (관리자/운영자/회사직원만)
+# -----------------------------------------------------------------------------
+_ALLOWED_ROLE_IDS = (6, 7, 8)
+
+
+class UserListOut(BaseModel):
+    id: int
+    name: str
+    email: Optional[str] = None
+    role_id: Optional[int] = None
+    department_id: Optional[int] = None
+    status: Optional[str] = None
+
+
+def _get_internal_users(db: Session) -> List[User]:
+    q = db.query(User)
+    if hasattr(User, "role_id"):
+        q = q.filter(User.role_id.in_(_ALLOWED_ROLE_IDS))
+    return q.order_by(User.id.asc()).all()
+
+
+@router.get("/users", response_model=List[UserListOut])
+@router.get("/api/attendance/users", response_model=List[UserListOut])
+def list_internal_users(db: Session = Depends(get_db)):
+    """출퇴근 화면에서 사용할 내부 직원 목록(관리자/운영자/회사직원)."""
+    users = _get_internal_users(db)
+    out: List[UserListOut] = []
+    for u in users:
+        out.append(
+            UserListOut(
+                id=int(getattr(u, "id")),
+                name=str(getattr(u, "name", "") or getattr(u, "username", "") or ""),
+                email=getattr(u, "email", None),
+                role_id=getattr(u, "role_id", None),
+                department_id=getattr(u, "department_id", None),
+                status=getattr(u, "status", None),
+            )
+        )
+    return out
+
+
+def _filter_today_status_to_internal(db: Session, items):
+    """today/status 결과에서 내부 직원만 남김 (외부/guest 차단)."""
+    try:
+        allowed_ids = {int(u.id) for u in _get_internal_users(db)}
+    except Exception:
+        return items
+
+    if not isinstance(items, list):
+        return items
+
     filtered = []
-    for it in (rows or []):
+    for it in items:
         uid = None
         if isinstance(it, dict):
             uid = it.get("user_id")
         else:
             uid = getattr(it, "user_id", None)
-        if isinstance(uid, int) and (not internal_ids or uid in internal_ids):
-            filtered.append(it)
+        try:
+            if uid is not None and int(uid) in allowed_ids:
+                filtered.append(it)
+        except Exception:
+            continue
     return filtered
+
+    if isinstance(items, list):
+        return [it for it in items if int(getattr(it, "get", lambda k, d=None: it.get(k, d))("user_id", -1)) in allowed_ids]  # type: ignore
+    return items
 
 
 # -----------------------------------------------------------------------------
-
-def _get_internal_user_id_set(db: Session) -> set[int]:
-    """내부 인원(관리자/운영자/회사직원) user_id 집합."""
-    try:
-        q = db.query(User.id).filter(User.role_id.in_(INTERNAL_ROLE_IDS))
-        return {int(r[0]) for r in q.all()}
-    except Exception:
-        # role_id 컬럼이 없거나 예외 발생 시: 안전하게 전체 사용자로 폴백(단, 프론트에서도 2차 필터링)
-        try:
-            q = db.query(User.id)
-            return {int(r[0]) for r in q.all()}
-        except Exception:
-            return set()
 # Helpers
 # -----------------------------------------------------------------------------
 def _pick_last_meta_for_day(db: Session, user_id: int, work_date: date):

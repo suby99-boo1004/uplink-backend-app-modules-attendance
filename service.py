@@ -60,6 +60,14 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
     #     야간은 다음날 귀속이지만, '오늘 현황'에도 진행중 세션으로 보여야 함.
     # → 오늘 KST 날짜에 시작했고 아직 미퇴근인 야간 세션은 오늘 조회에 포함.
     now_kst = datetime.now(KST)
+
+    # 내부직원(관리자/운영자/회사직원)만 조회 대상
+    # role_id: 6(관리자), 7(운영자), 8(회사직원)
+    allowed_user_ids = None
+    if hasattr(User, "role_id"):
+        allowed_user_ids = set(
+            [r[0] for r in db.query(User.id).filter(User.role_id.in_([6, 7, 8])).all()]
+        )
     # (추가) 연/누적 휴가(월차/반차) 사용량 집계
     year_start = date(target_date.year, 1, 1)
     leave_rows = (
@@ -110,7 +118,10 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
     # include_all=true면 오늘 세션이 없어도 모든 유저를 포함
     user_map = {}
     if include_all:
-        for u in db.query(User).order_by(User.id.asc()).all():
+        q = db.query(User).order_by(User.id.asc())
+        if allowed_user_ids is not None:
+            q = q.filter(User.id.in_(list(allowed_user_ids)))
+        for u in q.all():
             user_map[u.id] = {
                 "user_id": u.id,
                 "user_name": u.name,
@@ -139,6 +150,8 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
             name_map[u.id] = u.name
 
     for user_id, ss in by_user.items():
+        if allowed_user_ids is not None and user_id not in allowed_user_ids:
+            continue
         # ------------------------------------------------------------------
         # 핵심 규칙(대표님 고정): 야간(NIGHT)은 "다음날 근무"로 귀속
         #

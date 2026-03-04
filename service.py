@@ -9,6 +9,7 @@ from sqlalchemy import and_, or_, func
 
 from app.models.work_session import WorkSession
 from app.models.user import User
+from app.modules.attendance.utils import calc_work_date_basis
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -138,17 +139,39 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
             name_map[u.id] = u.name
 
     for user_id, ss in by_user.items():
+        # ------------------------------------------------------------------
+        # 핵심 규칙(대표님 고정): 야간(NIGHT)은 "다음날 근무"로 귀속
+        #
+        # today/status는 화면상 "오늘 현황"이므로,
+        # - 표시(근무중 여부/세션 목록)는 열린 세션을 포함해 보여줄 수 있음
+        # - 하지만 근무시간 합산/출근·퇴근시간/건수 집계는
+        #   반드시 (work_date_basis == target_date) 기준으로만 계산해야
+        #   야간 근무가 전날에 잘못 누적되는 문제가 사라짐.
+        # ------------------------------------------------------------------
+        ss_for_day: list[WorkSession] = []
+        ss_extra: list[WorkSession] = []
+        for s in ss:
+            # DB에 work_date_basis가 있으면 그 값을 우선 사용하고,
+            # 혹시 누락/불일치가 있으면 계산값으로 보강.
+            basis = getattr(s, "work_date_basis", None)
+            if basis is None:
+                basis = calc_work_date_basis(s.start_at, s.end_at, getattr(s, "shift_type", "DAY"))
+
+            if basis == target_date:
+                ss_for_day.append(s)
+            else:
+                ss_extra.append(s)
         total_minutes = 0
         is_holiday = False
 
         # 세션 상세(시간대) - 휴가(월차/반차) 포함
         sessions_detail = []
 
-        # 휴가/조퇴/반차 마커 제외한 '근무 세션' 건수
+        # 휴가/조퇴/반차 마커 제외한 '근무 세션' 건수 (오늘 귀속만)
         work_session_count = len(
             [
                 s
-                for s in ss
+                for s in ss_for_day
                 if (s.session_type or "") not in ("LEAVE", "HALF_LEAVE", "EARLY_LEAVE")
             ]
         )
@@ -157,7 +180,7 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
         # 1) LEAVE(월차) 2) HALF_LEAVE(반차) 3) EARLY_LEAVE(조퇴)
         # 4) 진행중(end_at=None) 5) 마지막 세션
         def _last_of(stypes: set[str]):
-            cand = [x for x in ss if (x.session_type or "") in stypes]
+            cand = [x for x in ss_for_day if (x.session_type or "") in stypes]
             if not cand:
                 return None
             # ss는 start_at ASC 정렬되어 있으므로 마지막이 최신
@@ -177,16 +200,24 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
             rep = rep_early
             is_working = False
         else:
-            open_sessions = [x for x in ss if x.end_at is None]
-            if open_sessions:
-                rep = open_sessions[-1]
+            # "오늘 귀속" 열린 세션 우선
+            open_sessions_today = [x for x in ss_for_day if x.end_at is None]
+            if open_sessions_today:
+                rep = open_sessions_today[-1]
                 is_working = True
             else:
-                rep = ss[-1]
-                is_working = False
+                # (표시 보강) 오늘 귀속 세션이 없지만 열린 세션이 있다면
+                # 야간(다음날 귀속) 근무중일 수 있으므로 대표세션으로 사용.
+                open_sessions_any = [x for x in ss if x.end_at is None]
+                if open_sessions_any:
+                    rep = open_sessions_any[-1]
+                    is_working = True
+                else:
+                    rep = (ss_for_day[-1] if ss_for_day else ss[-1])
+                    is_working = False
 
-        # 합산 근무시간: 미퇴근은 현재시각까지 누적
-        for s in ss:
+        # 합산 근무시간: "오늘 귀속"만 누적 (야간 다음날 귀속 규칙 반영)
+        for s in ss_for_day:
             stype = (s.session_type or '')
 
             # 월차는 시간 개념이 없음 (표시도 제외)
@@ -241,6 +272,36 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
             if s.is_holiday:
                 is_holiday = True
 
+        # 세션 상세 표시: 오늘 귀속 세션 + (표시용) 추가 세션(열린 야간 등)
+        # - extra는 근무시간 합산에는 포함하지 않음
+        for s in ss_extra:
+            stype = (s.session_type or '')
+            if stype == 'LEAVE':
+                sessions_detail.append({
+                    'session_type': s.session_type,
+                    'shift_type': s.shift_type,
+                    'is_holiday': bool(s.is_holiday),
+                    'place': s.place,
+                    'task': s.task,
+                    'start_at': None,
+                    'end_at': None,
+                })
+                continue
+            start_kst_dt = _ensure_aware(s.start_at).astimezone(KST) if s.start_at else None
+            sessions_detail.append(
+                {
+                    "session_type": s.session_type,
+                    "shift_type": s.shift_type,
+                    "is_holiday": bool(s.is_holiday),
+                    "place": s.place,
+                    "task": s.task,
+                    "start_at": start_kst_dt.isoformat() if start_kst_dt else None,
+                    "end_at": (
+                        _ensure_aware(s.end_at).astimezone(KST).isoformat() if s.end_at else None
+                    ),
+                }
+            )
+
         # 대표 상태 구성
         status = rep.session_type or "NONE"
         shift_type = rep.shift_type
@@ -267,15 +328,15 @@ def summarize_today(db: Session, target_date: date, include_all: bool = False):
                 marker_dt = _ensure_aware(rep.end_at or rep.start_at).astimezone(KST)
             check_out_iso = marker_dt.isoformat() if marker_dt else None
         else:
-            non_leave_sessions = [s for s in ss if (s.session_type or "") not in ("LEAVE", "HALF_LEAVE", "EARLY_LEAVE")]
+            non_leave_sessions = [s for s in ss_for_day if (s.session_type or "") not in ("LEAVE", "HALF_LEAVE", "EARLY_LEAVE")]
             start_candidates = non_leave_sessions or ss
             start_values = [_ensure_aware(s.start_at).astimezone(KST) for s in start_candidates if s.start_at]
             check_in_dt = min(start_values) if start_values else None
 
-            if any(s.end_at is None for s in ss):
+            if any(s.end_at is None for s in ss_for_day):
                 check_out_iso = None
             else:
-                end_candidates = [s for s in ss if s.end_at]
+                end_candidates = [s for s in ss_for_day if s.end_at]
                 check_out_iso = (
                     max(_ensure_aware(s.end_at).astimezone(KST) for s in end_candidates).isoformat()
                     if end_candidates

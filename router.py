@@ -25,6 +25,8 @@ from app.modules.attendance.service import summarize_today
 router = APIRouter(tags=["Attendance"])
 KST = ZoneInfo("Asia/Seoul")
 
+INTERNAL_ROLE_IDS = (6, 7, 8)  # 관리자/운영자/회사직원
+
 
 # -----------------------------------------------------------------------------
 # Auth dependency (defensive load)
@@ -61,10 +63,35 @@ def today_status(
     db: Session = Depends(get_db),
 ):
     today_kst = datetime.now(KST).date()
-    return summarize_today(db, today_kst, include_all=include_all)
+    internal_ids = _get_internal_user_id_set(db)
+    rows = summarize_today(db, today_kst, include_all=include_all)
+    # summarize_today 반환 형태(dict/obj) 모두 대응
+    filtered = []
+    for it in (rows or []):
+        uid = None
+        if isinstance(it, dict):
+            uid = it.get("user_id")
+        else:
+            uid = getattr(it, "user_id", None)
+        if isinstance(uid, int) and (not internal_ids or uid in internal_ids):
+            filtered.append(it)
+    return filtered
 
 
 # -----------------------------------------------------------------------------
+
+def _get_internal_user_id_set(db: Session) -> set[int]:
+    """내부 인원(관리자/운영자/회사직원) user_id 집합."""
+    try:
+        q = db.query(User.id).filter(User.role_id.in_(INTERNAL_ROLE_IDS))
+        return {int(r[0]) for r in q.all()}
+    except Exception:
+        # role_id 컬럼이 없거나 예외 발생 시: 안전하게 전체 사용자로 폴백(단, 프론트에서도 2차 필터링)
+        try:
+            q = db.query(User.id)
+            return {int(r[0]) for r in q.all()}
+        except Exception:
+            return set()
 # Helpers
 # -----------------------------------------------------------------------------
 def _pick_last_meta_for_day(db: Session, user_id: int, work_date: date):
